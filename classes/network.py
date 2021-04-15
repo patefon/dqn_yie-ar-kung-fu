@@ -23,7 +23,7 @@ class SimpleNet(nn.Module):
         self.fc1 = nn.Linear(8320, 512) # [batch_size, 64, 5, 26] -> flatten -> [batch_size, 8320, 512]
         self.fc2 = nn.Linear(512, n_actions) # [batch_size, 128] -> [batch_size, n_actions]
         
-        # ativation
+        # activation
         self.relu = nn.ReLU()
 
         # etc
