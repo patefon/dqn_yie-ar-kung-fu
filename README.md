@@ -4,8 +4,10 @@ This is a demo project built with a goal to explore in more details computer vis
 
 ![alt](resources/preview.gif)
 
+[agent gameplay / youtube](https://www.youtube.com/watch?v=fHK_tgkpKNg "agent gameplay / youtube")
+
 #### Requirements:
-- Linux Debian/Ubuntu/Mint
+- Linux Debian / Ubuntu / Mint
 - python 3.8 / pytorch / openCV
 - nestopia (as a NES emulator)
 
