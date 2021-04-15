@@ -2,7 +2,7 @@
 ----
 This is a demo project built with a goal to explore in more details computer vision (CV) and reincorcement learning (RL) and has no any commercial use.
 
-![resources/preview-gif](preview.gif)
+![alt](resources/preview.gif)
 
 #### Requirements:
 - Linux Debian/Ubuntu/Mint
