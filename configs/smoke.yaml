@@ -1,0 +1,108 @@
+env:
+  game: YieArKungFu-Nes
+  state: Level1
+  frame_skip: 4
+  max_pool_frames: true
+  frame_stack: 4
+  obs_height: 84
+  obs_width: 84
+  grayscale: true
+  sticky_action_prob: 0.25
+  noop_max: 30
+  max_episode_steps: 6000
+  stall_timeout: 600
+  gameover_patience: 8
+  hud:
+    score:
+      x: 16
+      y: 40
+      w: 48
+      h: 8
+    high_score:
+      x: 88
+      y: 40
+      w: 48
+      h: 8
+    stage:
+      x: 208
+      y: 32
+      w: 16
+      h: 8
+    player_health:
+      x: 40
+      y: 202
+      w: 64
+      h: 4
+    enemy_health:
+      x: 136
+      y: 202
+      w: 64
+      h: 4
+    lives:
+      x: 160
+      y: 40
+      w: 40
+      h: 8
+    lives_pixels_per_icon: 37
+    gameover_banner:
+      x: 64
+      y: 114
+      w: 128
+      h: 12
+    gameover_banner_min_pixels: 40
+    playfield:
+      x: 0
+      y: 62
+      w: 240
+      h: 150
+    health_fill_rgb:
+    - - 72
+      - 220
+      - 72
+    health_match_tolerance: 24
+    transition_max_colors: 4
+reward:
+  score_scale: 0.01
+  damage_dealt: 1.0
+  damage_taken: -1.0
+  stage_clear: 10.0
+  death: -10.0
+  time_penalty: -0.001
+  clip: 5.0
+replay:
+  capacity: 40000
+  prioritized: true
+  alpha: 0.6
+  beta_start: 0.4
+  beta_frames: 1000000
+  n_step: 3
+dqn:
+  double: true
+  dueling: true
+  noisy: false
+  gamma: 0.99
+  lr: 6.25e-05
+  adam_eps: 0.00015
+  batch_size: 32
+  huber_delta: 1.0
+  max_grad_norm: 10.0
+  learn_start: 2000
+  train_every: 4
+  target_sync_every: 8000
+  eps_start: 1.0
+  eps_end: 0.01
+  eps_decay_steps: 20000
+train:
+  total_steps: 40000
+  num_envs: 4
+  seed: 0
+  device: auto
+  torch_compile: false
+  amp: true
+  run_dir: runs
+  run_name: smoke
+  checkpoint_every: 20000
+  eval_every: 20000
+  eval_episodes: 2
+  record_eval_video: false
+  auto_resume: true
