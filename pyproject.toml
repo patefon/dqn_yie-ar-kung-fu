@@ -1,0 +1,69 @@
+[project]
+name = "kungfu-rl"
+version = "2.0.0"
+description = "Vision-based deep RL agent that learns to play Yie Ar Kung-Fu (NES) from raw pixels."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11,<3.14"
+
+dependencies = [
+    # Emulator + environment API.
+    # stable-retro gives us a synchronous, deterministic, headless NES framebuffer.
+    # We use it ONLY as a frame source -- the agent never reads emulator RAM.
+    "stable-retro>=1.0.1",
+    "gymnasium>=1.3.0",
+    # Numerics / vision.
+    "numpy>=2.1",
+    "opencv-python-headless>=4.10",
+    # Learning.
+    "torch>=2.6",
+    # Config, CLI, logging, artifacts.
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "tyro>=0.9",
+    "rich>=13.9",
+    "tensorboard>=2.18",
+    "imageio[ffmpeg]>=2.36",
+    # Pinned below 2.0 on purpose: moviepy 2.x removed `moviepy.editor`, which
+    # tensorboard's add_video still imports. Without it the eval clips are
+    # written to runs/<name>/videos/ but not embedded in TensorBoard.
+    "moviepy<2",
+]
+
+[project.optional-dependencies]
+# Reference baselines to race our own DQN against.
+baselines = ["stable-baselines3>=2.9"]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[project.scripts]
+kungfu-train = "kungfu.train:main"
+kungfu-eval = "kungfu.evaluate:main"
+kungfu-setup = "kungfu.emulator.integration:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kungfu"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "NPY"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true

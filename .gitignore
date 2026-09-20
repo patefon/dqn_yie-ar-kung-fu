@@ -146,3 +146,11 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# --- project ---
+roms/*.nes
+integrations/*/rom.nes
+runs/
+out/
+weights/
+*.state
