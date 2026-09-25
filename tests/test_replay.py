@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from kungfu.rl.replay import FrameReplayBuffer, SumTree
+from kungfu.rl.buffers import FrameReplayBuffer, SumTree
 
 
 def make_buffer(**kw):
@@ -179,3 +179,81 @@ class TestSumTree:
         picks = tree.sample(np.random.default_rng(0).random(4000) * tree.total)
         share = (picks == 1).mean()
         assert 0.70 < share < 0.80  # expect ~0.75
+
+
+class TestResumeWarmup:
+    """A resumed checkpoint must refill the replay before it learns again.
+
+    `learn_start` used to be compared against the agent's global step counter.
+    That is fine on a fresh run, where steps and buffer fill advance together,
+    but a checkpoint resumed at 10M steps starts with an empty buffer and would
+    begin updating immediately -- sampling batches of 32 from a handful of
+    transitions, with PER concentrating on them.
+    """
+
+    def _agent(self, tmp_path, steps):
+        import torch
+
+        from kungfu.config import Config
+        from kungfu.rl.algos import build_agent
+
+        cfg = Config()
+        cfg.train.num_envs = 2
+        cfg.dqn.learn_start = 1000
+        agent = build_agent(
+            cfg, (4, 84, 84), 17, torch.device("cpu"), seed=0, num_envs=2
+        )
+        agent.steps = steps
+        return agent
+
+    def test_resumed_agent_waits_for_learn_start_not_the_step_counter(self, tmp_path):
+        """The gap the old guard left open.
+
+        `memory.ready` only requires stack + n_step + 2 columns, so an empty
+        buffer was caught by luck. A buffer holding a couple of hundred
+        transitions clears `ready` but is still 5x short of learn_start -- and
+        with the old step-based guard a resumed agent trained on it.
+        """
+        import numpy as np
+
+        from kungfu.train import Transition
+
+        agent = self._agent(tmp_path, steps=10_000_000)
+        rng = np.random.default_rng(0)
+        for i in range(100):
+            agent.observe(
+                Transition(
+                    obs=rng.integers(0, 255, (2, 84, 84), dtype=np.uint8),
+                    actions=np.zeros(2, dtype=np.int64),
+                    rewards=np.zeros(2, dtype=np.float32),
+                    terminated=np.zeros(2, dtype=bool),
+                    truncated=np.zeros(2, dtype=bool),
+                    episode_starts=np.full(2, i == 0),
+                    next_obs=rng.integers(0, 255, (2, 84, 84), dtype=np.uint8),
+                )
+            )
+        assert agent.memory.ready, "precondition: the old guard would have let this pass"
+        assert len(agent.memory) == 200 < agent.cfg.learn_start
+        assert agent.learn() is None, "trained on 200 transitions after a resume"
+
+    def test_learning_starts_once_the_buffer_fills(self, tmp_path):
+        import numpy as np
+
+        from kungfu.train import Transition
+
+        agent = self._agent(tmp_path, steps=10_000_000)
+        rng = np.random.default_rng(0)
+        for i in range(700):
+            agent.observe(
+                Transition(
+                    obs=rng.integers(0, 255, (2, 84, 84), dtype=np.uint8),
+                    actions=np.zeros(2, dtype=np.int64),
+                    rewards=np.zeros(2, dtype=np.float32),
+                    terminated=np.zeros(2, dtype=bool),
+                    truncated=np.zeros(2, dtype=bool),
+                    episode_starts=np.full(2, i == 0),
+                    next_obs=rng.integers(0, 255, (2, 84, 84), dtype=np.uint8),
+                )
+            )
+        assert len(agent.memory) == 1400 >= 1000
+        assert agent.learn() is not None, "never resumed learning after refilling"

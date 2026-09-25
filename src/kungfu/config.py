@@ -87,12 +87,26 @@ class HudLayout(BaseModel):
     transition_max_colors: int = Field(default=4, ge=2, le=32)
 
 
+class StartState(BaseModel):
+    """One savestate the episode may begin from, and how often to pick it."""
+
+    name: str
+    weight: float = Field(default=1.0, gt=0.0)
+
+
 class EnvConfig(BaseModel):
     """Environment dynamics. These knobs did not exist before -- the old loop ran
     "as fast as the queue allowed", which is why its transitions were not an MDP."""
 
     game: str = "YieArKungFu-Nes"
     state: str = "Level1"
+    # Start-state curriculum. Every episode starting at stage 1 means ~96% of
+    # experience is spent replaying stages the agent already beat -- measured:
+    # of ~11,700 steps in an uncapped run, only ~500 are past stage 20. Seeding
+    # some episodes further in puts the experience where the agent actually
+    # fails. None keeps the single `state` above, which is the original
+    # behaviour.
+    start_states: list[StartState] | None = None
 
     # Each agent action is held for this many emulator frames. 4 is the Atari/DQN
     # standard and, critically, it is long enough for a NES attack animation to
@@ -155,6 +169,60 @@ class ReplayConfig(BaseModel):
     n_step: int = Field(default=3, ge=1, le=10)
 
 
+class EncoderConfig(BaseModel):
+    """Which visual trunk to use. Independent of the algorithm.
+
+    ``nature_cnn`` at width 1.0 is the Mnih et al. convnet and is bit-exact
+    with the pre-refactor network, so it remains the baseline.
+    """
+
+    name: str = "nature_cnn"
+    hidden: int = Field(default=512, gt=0)
+    """Width of the head's hidden layer."""
+    width: float = Field(default=1.0, gt=0.0)
+    """Channel multiplier. 1.0 is the published architecture."""
+    channels: list[int] | None = None
+    """Per-stage channels; only used by encoders that take them (impala)."""
+
+    @property
+    def kwargs(self) -> dict:
+        """Extra arguments for the encoder constructor, minus head-only keys."""
+        out: dict = {"width": self.width}
+        if self.channels is not None:
+            out["channels"] = tuple(self.channels)
+        return out
+
+
+class PPOConfig(BaseModel):
+    """On-policy actor-critic. Collects a segment, then does several epochs on it.
+
+    Unlike DQN there is no replay and no epsilon: the policy is stochastic by
+    construction and exploration comes from entropy regularisation.
+    """
+
+    gamma: float = Field(default=0.99, gt=0.0, le=1.0)
+    gae_lambda: float = Field(default=0.95, ge=0.0, le=1.0)
+    """Bias/variance dial for advantage estimation. 1.0 = Monte Carlo, 0.0 = TD(0)."""
+    lr: float = Field(default=2.5e-4, gt=0.0)
+    adam_eps: float = Field(default=1e-5, gt=0.0)
+
+    horizon: int = Field(default=128, gt=0)
+    """Steps collected per env before each update."""
+    epochs: int = Field(default=4, gt=0)
+    minibatch_size: int = Field(default=256, gt=0)
+
+    clip_coef: float = Field(default=0.1, gt=0.0)
+    """The trust region. Larger moves faster and destabilises sooner."""
+    value_coef: float = Field(default=0.5, ge=0.0)
+    entropy_coef: float = Field(default=0.01, ge=0.0)
+    """Exploration pressure. PPO's counterpart to epsilon."""
+    max_grad_norm: float = Field(default=0.5, gt=0.0)
+    normalize_advantage: bool = True
+    clip_value_loss: bool = True
+    target_kl: float | None = Field(default=0.03, gt=0.0)
+    """Stop the epoch loop early if the policy has moved this far. None disables."""
+
+
 class DQNConfig(BaseModel):
     """Modern DQN. The original was vanilla 2013-era DQN with an MSE loss."""
 
@@ -201,10 +269,16 @@ class TrainConfig(BaseModel):
 
 
 class Config(BaseModel):
+    # Which learner to run. The encoder is chosen independently, so any
+    # algorithm can be paired with any trunk.
+    algo: str = "dqn"
+    encoder: EncoderConfig = EncoderConfig()
+
     env: EnvConfig = EnvConfig()
     reward: RewardConfig = RewardConfig()
     replay: ReplayConfig = ReplayConfig()
     dqn: DQNConfig = DQNConfig()
+    ppo: PPOConfig = PPOConfig()
     train: TrainConfig = TrainConfig()
 
     @classmethod

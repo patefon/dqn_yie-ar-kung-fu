@@ -50,10 +50,10 @@ setup: rom calibrate atlas check ## Full first-time setup after dropping in a RO
 smoke: ## 40k-step training run to prove the pipeline end to end (~3 min)
 	$(PY) -m kungfu.train --config configs/smoke.yaml
 
-train: ## Full training run: make train NAME=run1
-	$(PY) -m kungfu.train --config $(CONFIG) --run-name $(NAME)
+train: ## Full training run: make train NAME=run1 [ARGS=--resume runs/old/final.pt]
+	$(PY) -m kungfu.train --config $(CONFIG) --run-name $(NAME) $(ARGS)
 
-go: ## Train AND watch in one command: make go NAME=run1
+go: ## Train AND watch in one command: make go NAME=run1 [ARGS=--resume ...]
 	@mkdir -p $(dir $(RUN))
 	@echo "viewer      -> http://localhost:$(PORT)"
 	@echo "viewer log  -> $(RUN)-viewer.log"
@@ -64,10 +64,10 @@ go: ## Train AND watch in one command: make go NAME=run1
 	        --envs $(WATCH_ENVS) --cols 3 --port $(PORT) > $(RUN)-viewer.log 2>&1 & \
 	  VIEWER=$$!; \
 	  trap 'kill $$VIEWER 2>/dev/null; echo; echo "viewer stopped"' EXIT INT TERM; \
-	  $(PY) -m kungfu.train --config $(CONFIG) --run-name $(NAME)
+	  $(PY) -m kungfu.train --config $(CONFIG) --run-name $(NAME) $(ARGS)
 
-eval: ## Evaluate the finished run: make eval NAME=run1
-	$(PY) -m kungfu.evaluate --checkpoint $(RUN)/final.pt --episodes 10 --video out/best.mp4
+eval: ## Evaluate the finished run: make eval NAME=run1 [ARGS=--endless]
+	$(PY) -m kungfu.evaluate --checkpoint $(RUN)/final.pt --episodes 10 --video out/best.mp4 $(ARGS)
 
 watch: ## Live mosaic against an existing run: make watch NAME=run1 [ARGS=--endless]
 	$(PY) -m tools.watch --run $(RUN) --envs $(WATCH_ENVS) --cols 3 --port $(PORT) $(ARGS)

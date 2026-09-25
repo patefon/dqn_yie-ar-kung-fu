@@ -11,8 +11,8 @@ env:
   frame_skip: 4
   max_pool_frames: true
   frame_stack: 4
-  obs_height: 84
-  obs_width: 84
+  obs_height: 94
+  obs_width: 150
   grayscale: true
   sticky_action_prob: 0.25
   noop_max: 30

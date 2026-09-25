@@ -12,6 +12,7 @@ at presentation size, with sound, to a file you can share.
 
 from __future__ import annotations
 
+import itertools
 import subprocess
 import tempfile
 import time
@@ -27,18 +28,18 @@ from rich.console import Console
 
 from kungfu.config import Config
 from kungfu.envs.actions import ACTION_COMBOS
-from kungfu.rl.dqn import DQNAgent
+from kungfu.rl.algos import build_agent
 from tools.mjpeg import FrameSlot, serve
 
 console = Console()
 
 NES_W, NES_H = 240, 224
 PANEL_W = 300
-BG = (26, 20, 16)          # BGR
+BG = (26, 20, 16)  # BGR
 PANEL_BG = (38, 30, 24)
 IDLE = (74, 62, 54)
-LIT = (110, 196, 92)       # green
-LIT_A = (90, 120, 240)     # A = warm
+LIT = (110, 196, 92)  # green
+LIT_A = (90, 120, 240)  # A = warm
 TEXT = (242, 246, 247)
 DIM = (150, 136, 124)
 
@@ -59,7 +60,8 @@ class Args:
     You normally want both."""
     max_seconds: float = 3600.0
     """Safety stop for --episodes, so a very long-lived agent cannot fill the
-    disk. 1020x986 at 60fps is roughly 1 MB per second of footage."""
+    disk. 1020x986 at 60fps is roughly 1 MB per second of footage.
+    Set 0 to remove it entirely and record until the agent truly loses."""
     scale: int = 3
     """Upscale of the 240x224 framebuffer."""
     epsilon: float = 0.01
@@ -78,6 +80,10 @@ class Args:
     """Override the no-score-progress timeout (config default 600 steps)."""
     endless: bool = False
     """Remove both caps: play until the agent actually loses all its lives."""
+    start_state: str | None = None
+    """Begin at this savestate (e.g. Stage21) instead of stage 1. By default a
+    demo always plays a real game from the start, ignoring any training
+    curriculum in the checkpoint's config."""
     live: bool = False
     """Also stream what is being recorded to a browser, while it records."""
     port: int = 8081
@@ -133,11 +139,27 @@ def draw_pad(panel: np.ndarray, pressed: set[str], x0: int, y0: int) -> None:
         bx, by = x0 + 150 + dx, cy
         cv2.circle(panel, (bx, by), 19, colour if on(name) else IDLE, -1)
         cv2.circle(panel, (bx, by), 19, BG, 1)
-        cv2.putText(panel, name, (bx - 7, by + 6), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, BG if on(name) else DIM, 2, cv2.LINE_AA)
+        cv2.putText(
+            panel,
+            name,
+            (bx - 7, by + 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            BG if on(name) else DIM,
+            2,
+            cv2.LINE_AA,
+        )
 
-    cv2.putText(panel, "A = punch    B = kick", (x0, y0 + 104),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, DIM, 1, cv2.LINE_AA)
+    cv2.putText(
+        panel,
+        "A = punch    B = kick",
+        (x0, y0 + 104),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38,
+        DIM,
+        1,
+        cv2.LINE_AA,
+    )
 
 
 # Oldest -> newest. Max-blending these means static scenery (present in every
@@ -145,10 +167,10 @@ def draw_pad(panel: np.ndarray, pressed: set[str], x0: int, y0: int) -> None:
 # This is the 3-frames-as-RGB-channels idea generalised: it still works when the
 # stack is not exactly 3 deep, and it says which way time runs.
 TRAIL_BGR = (
-    (210, 90, 70),     # t-3  blue
-    (200, 170, 60),    # t-2  teal
-    (90, 200, 225),    # t-1  amber
-    (255, 255, 255),   # t    white = now
+    (210, 90, 70),  # t-3  blue
+    (200, 170, 60),  # t-2  teal
+    (90, 200, 225),  # t-1  amber
+    (255, 255, 255),  # t    white = now
 )
 
 
@@ -164,11 +186,11 @@ def motion_composite(stack: np.ndarray) -> np.ndarray:
 
 
 def draw_vision_strip(
-    stack: np.ndarray, width: int, zoom: int = 2, motion_zoom: int = 3
+    stack: np.ndarray, width: int, motion_scale: float = 1.5, max_tile_h: int = 220
 ) -> np.ndarray:
     """Two screens in one strip.
 
-    Left: the exact tensor the network receives -- `stack` is (N, 84, 84) uint8,
+    Left: the exact tensor the network receives -- `stack` is (N, H, W) uint8,
     greyscale, downscaled, cropped to the playfield. It looks far poorer than
     the game because that is genuinely all the agent has to go on.
 
@@ -176,59 +198,111 @@ def draw_vision_strip(
     max-blended, so static scenery reads white and anything that moved leaves a
     coloured trail. A single frame cannot tell you whether a leg is extending or
     retracting; this is the information the stack exists to provide.
+
+    Tile size is derived from the space available rather than a fixed zoom, so
+    the strip fits any observation shape. A hardcoded 2x zoom happened to fit
+    84x84 and overflowed the canvas the moment the observation became 94x150.
     """
     n, h, w = stack.shape
-    tile_w, tile_h = w * zoom, h * zoom
-    mot_w, mot_h = w * motion_zoom, h * motion_zoom
-    pad, top, label_h = 12, 36, 26
+    pad, top, label_h, margin = 12, 36, 26, 18
+
+    # Solve for a tile width that fits n filmstrip tiles plus the movement
+    # panel, then derive height from the observation's own aspect ratio.
+    usable = width - 2 * margin - (n + 1) * pad
+    tile_w = max(1, int(usable / (n + motion_scale)))
+    tile_h = max(1, int(round(tile_w * h / w)))
+    if tile_h > max_tile_h:
+        tile_h = max_tile_h
+        tile_w = max(1, int(round(tile_h * w / h)))
+    mot_w = max(1, int(tile_w * motion_scale))
+    mot_h = max(1, int(round(mot_w * h / w)))
     strip_h = top + max(tile_h, mot_h) + label_h
 
     strip = np.full((strip_h, width, 3), PANEL_BG, dtype=np.uint8)
-    cv2.putText(strip, "WHAT THE NETWORK SEES", (18, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.46, TEXT, 1, cv2.LINE_AA)
-    cv2.putText(strip, f"{n} x {h}x{w} greyscale", (250, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, DIM, 1, cv2.LINE_AA)
+    cv2.putText(
+        strip,
+        "WHAT THE NETWORK SEES",
+        (18, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.46,
+        TEXT,
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        strip,
+        f"{n} x {h}x{w} greyscale",
+        (250, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38,
+        DIM,
+        1,
+        cv2.LINE_AA,
+    )
 
     # Bottom-align the filmstrip with the larger movement panel.
     base = top + max(tile_h, mot_h)
     x, y = 18, base - tile_h
     for i in range(n):
         tile = cv2.resize(stack[i], (tile_w, tile_h), interpolation=cv2.INTER_NEAREST)
-        strip[y:y + tile_h, x:x + tile_w] = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
-        cv2.rectangle(strip, (x, y), (x + tile_w, y + tile_h),
-                      TRAIL_BGR[i % len(TRAIL_BGR)], 1)
+        strip[y : y + tile_h, x : x + tile_w] = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
+        cv2.rectangle(strip, (x, y), (x + tile_w, y + tile_h), TRAIL_BGR[i % len(TRAIL_BGR)], 1)
         label = "t (now)" if i == n - 1 else f"t-{n - 1 - i}"
-        cv2.putText(strip, label, (x, base + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                    TRAIL_BGR[i % len(TRAIL_BGR)], 1, cv2.LINE_AA)
+        cv2.putText(
+            strip,
+            label,
+            (x, base + 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            TRAIL_BGR[i % len(TRAIL_BGR)],
+            1,
+            cv2.LINE_AA,
+        )
         x += tile_w + pad
 
     x += pad
     if x + mot_w <= width - 8:
-        comp = cv2.resize(motion_composite(stack), (mot_w, mot_h),
-                          interpolation=cv2.INTER_NEAREST)
+        comp = cv2.resize(motion_composite(stack), (mot_w, mot_h), interpolation=cv2.INTER_NEAREST)
         my = base - mot_h
-        strip[my:my + mot_h, x:x + mot_w] = comp
+        strip[my : my + mot_h, x : x + mot_w] = comp
         cv2.rectangle(strip, (x, my), (x + mot_w, my + mot_h), TEXT, 1)
-        cv2.putText(strip, "MOVEMENT", (x, my - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.46, TEXT, 1, cv2.LINE_AA)
-        cv2.putText(strip, "all 4 frames, oldest to newest", (x, base + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, DIM, 1, cv2.LINE_AA)
+        cv2.putText(
+            strip, "MOVEMENT", (x, my - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.46, TEXT, 1, cv2.LINE_AA
+        )
+        cv2.putText(
+            strip,
+            "all 4 frames, oldest to newest",
+            (x, base + 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            DIM,
+            1,
+            cv2.LINE_AA,
+        )
     return strip
 
 
-def compose(frame_rgb: np.ndarray, pressed: set[str], action_name: str,
-            info: dict, scale: int, elapsed: float,
-            stack: np.ndarray | None = None) -> np.ndarray:
+def compose(
+    frame_rgb: np.ndarray,
+    pressed: set[str],
+    action_name: str,
+    info: dict,
+    scale: int,
+    elapsed: float,
+    stack: np.ndarray | None = None,
+) -> np.ndarray:
     game = cv2.resize(
         cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
-        (NES_W * scale, NES_H * scale), interpolation=cv2.INTER_NEAREST,
+        (NES_W * scale, NES_H * scale),
+        interpolation=cv2.INTER_NEAREST,
     )
     h = game.shape[0]
     panel = np.full((h, PANEL_W, 3), PANEL_BG, dtype=np.uint8)
 
     def line(y: int, text: str, colour=TEXT, size=0.52, weight=1):
-        cv2.putText(panel, text, (18, y), cv2.FONT_HERSHEY_SIMPLEX, size,
-                    colour, weight, cv2.LINE_AA)
+        cv2.putText(
+            panel, text, (18, y), cv2.FONT_HERSHEY_SIMPLEX, size, colour, weight, cv2.LINE_AA
+        )
 
     line(38, "YIE AR KUNG-FU", TEXT, 0.62, 2)
     line(60, "trained agent, greedy policy", DIM, 0.4)
@@ -247,8 +321,9 @@ def compose(frame_rgb: np.ndarray, pressed: set[str], action_name: str,
 
     line(470, "ACTION", DIM, 0.4)
     line(494, action_name, LIT, 0.5)
-    cv2.putText(panel, f"{elapsed:5.1f}s", (18, h - 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, DIM, 1, cv2.LINE_AA)
+    cv2.putText(
+        panel, f"{elapsed:5.1f}s", (18, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, DIM, 1, cv2.LINE_AA
+    )
 
     top_row = np.hstack([game, panel])
     if stack is None:
@@ -267,6 +342,18 @@ def record(args: Args) -> Path:
     cfg_path = args.config or (args.checkpoint.parent / "config.yaml")
     cfg = Config.load(cfg_path if Path(cfg_path).exists() else None)
     apply_limit_overrides(cfg, args)
+    # A start-state curriculum belongs to training. Inheriting it here would
+    # seed the recording at whatever stage the weights happen to sample -- with
+    # the endgame curriculum that is stage 21 for most takes -- so a "full game"
+    # demo would silently begin two thirds of the way in. Same pin as evaluate.
+    if cfg.env.start_states and args.start_state is None:
+        console.print("[dim]ignoring training start_states; playing from stage 1[/dim]")
+        cfg.env = cfg.env.model_copy(update={"start_states": None})
+    if args.start_state is not None:
+        cfg.env = cfg.env.model_copy(
+            update={"start_states": None, "state": args.start_state}
+        )
+        console.print(f"starting from [bold]{args.start_state}[/bold]")
     console.print(f"config: [dim]{cfg_path if Path(cfg_path).exists() else 'defaults'}[/dim]")
     console.print(
         f"episode cap: [dim]{cfg.env.max_episode_steps:,} steps, "
@@ -275,21 +362,26 @@ def record(args: Args) -> Path:
 
     register(INTEGRATION_DIR)
     base = YieArKungFuEnv(
-        cfg.env, cfg.reward, DigitAtlas.load(ATLAS_PATH),
-        render_mode="rgb_array", capture_audio=not args.mute,
+        cfg.env,
+        cfg.reward,
+        DigitAtlas.load(ATLAS_PATH),
+        render_mode="rgb_array",
+        capture_audio=not args.mute,
     )
     env = ChannelStack(base, cfg.env.frame_stack)
     obs, _ = env.reset(seed=args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    agent = DQNAgent(
-        obs_shape=env.observation_space.shape,
-        n_actions=int(env.action_space.n),
-        dqn_cfg=cfg.dqn, replay_cfg=cfg.replay,
-        device=device, seed=args.seed, num_envs=1,
+    agent = build_agent(
+        cfg,
+        env.observation_space.shape,
+        int(env.action_space.n),
+        device,
+        seed=args.seed,
+        num_envs=1,
     )
     agent.load(args.checkpoint)
-    agent.online.eval()
+    agent.train_mode(False)
     console.print(f"loaded [green]{args.checkpoint.name}[/green] @ step {agent.steps:,}")
 
     rng = np.random.default_rng(args.seed)
@@ -300,7 +392,9 @@ def record(args: Args) -> Path:
     #   --episodes lifts the RECORDING cap   (when we stop filming)
     # A 60s recording of an uncapped episode still stops at 3600 frames.
     if args.episodes is not None:
-        total_steps = int(args.max_seconds * args.fps / skip)
+        # max_seconds <= 0 means "no recording cap at all": the only thing that
+        # stops us is the agent losing its last life.
+        total_steps = None if args.max_seconds <= 0 else int(args.max_seconds * args.fps / skip)
         stop_after_episodes = args.episodes
     else:
         total_steps = int(args.seconds * args.fps / skip)
@@ -322,13 +416,19 @@ def record(args: Args) -> Path:
     if args.live:
         slot = FrameSlot()
         server = serve(
-            slot, args.host, args.port, "Yie Ar Kung-Fu - recording demo",
+            slot,
+            args.host,
+            args.port,
+            "Yie Ar Kung-Fu - recording demo",
             f"live while writing {args.out.name}"
-            + ("" if args.realtime else " &middot; faster than realtime, pass --realtime to slow it"),
+            + (
+                ""
+                if args.realtime
+                else " &middot; faster than realtime, pass --realtime to slow it"
+            ),
         )
         console.print(
-            f"  [bold green]live[/bold green] -> "
-            f"[bold]http://localhost:{args.port}[/bold]"
+            f"  [bold green]live[/bold green] -> [bold]http://localhost:{args.port}[/bold]"
         )
 
     info: dict = {}
@@ -336,12 +436,12 @@ def record(args: Args) -> Path:
     written = 0
     frame_budget = skip / args.fps  # wall-clock seconds one agent step represents
     try:
-        for _ in range(total_steps):
+        for _ in itertools.count() if total_steps is None else range(total_steps):
             t0 = time.time()
             if rng.random() < args.epsilon:
                 action = int(rng.integers(0, int(env.action_space.n)))
             else:
-                action = int(agent.act(obs[None, ...], greedy=True)[0])
+                action = int(agent.act(obs[None, ...], greedy=True)[0][0])
 
             obs, _, term, trunc, info = env.step(action)
             if not args.mute:
@@ -354,9 +454,15 @@ def record(args: Args) -> Path:
             frame = env.render()
             if frame is None:
                 continue
-            canvas = compose(frame, pressed, name, info, args.scale,
-                             written / args.fps,
-                             stack=None if args.no_vision else obs)
+            canvas = compose(
+                frame,
+                pressed,
+                name,
+                info,
+                args.scale,
+                written / args.fps,
+                stack=None if args.no_vision else obs,
+            )
             # Hold the composed frame for the whole skip so video matches audio.
             for _ in range(skip):
                 writer.append_data(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
@@ -386,9 +492,7 @@ def record(args: Args) -> Path:
         if server is not None:
             server.shutdown()
 
-    console.print(
-        f"recorded {written:,} frames ({written / args.fps:.1f}s), {episodes} episode(s)"
-    )
+    console.print(f"recorded {written:,} frames ({written / args.fps:.1f}s), {episodes} episode(s)")
     if stop_after_episodes is None and episodes == 0:
         console.print(
             "[yellow]Recording hit the --seconds limit mid-episode. "
@@ -412,9 +516,22 @@ def record(args: Args) -> Path:
     from imageio_ffmpeg import get_ffmpeg_exe
 
     cmd = [
-        get_ffmpeg_exe(), "-y", "-loglevel", "error",
-        "-i", str(video_path), "-i", str(wav_path),
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(args.out),
+        get_ffmpeg_exe(),
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-i",
+        str(wav_path),
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest",
+        str(args.out),
     ]
     subprocess.run(cmd, check=True)
     dur = audio.shape[0] / max(rate, 1)

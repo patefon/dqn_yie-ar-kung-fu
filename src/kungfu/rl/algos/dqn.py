@@ -1,47 +1,32 @@
 """Double + Dueling + n-step DQN with prioritised replay.
 
-Corrections to the original agent
-----------------------------------
-* **Target network was never synchronised at init.** ``q_eval`` and ``q_target``
-  were two independently random networks, so the first 5,000 steps of bootstrapping
-  aimed at pure noise.
-* **No Double DQN.** Vanilla ``max_a Q_target(s', a)`` systematically
-  over-estimates. Double DQN (select with online, evaluate with target) is a
-  two-line change that was already standard practice in 2016.
-* **MSE loss.** Replaced with Huber: a single bad TD error no longer produces a
-  gradient spike large enough to wreck the network.
-* **No gradient clipping.**
-* **Epsilon decayed inside ``learn()``**, which only ran every 4th step and only
-  after burn-in, so the exploration schedule was implicitly coupled to
-  ``learn_every`` and to burn-in length. It is now a pure function of env steps.
-* **``load_models()`` existed but was never called**, so every run restarted from
-  scratch -- which makes the self-improvement cycle impossible. Checkpoints here
-  round-trip the optimizer state and the step counter too.
+The learning maths here is unchanged from the pre-refactor implementation --
+same targets, same loss, same schedules, same update cadence. What moved is the
+plumbing: the network is now an encoder + head pair, and the agent implements
+the shared ``Agent`` interface so the training loop does not know it is DQN.
+
+Corrections to the 2021 original are documented in REVIEW.md; the load-bearing
+ones are Double Q targets, Huber loss with gradient clipping, a target network
+synchronised at construction, and an epsilon schedule that is a pure function
+of environment steps rather than of gradient updates.
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from kungfu.config import DQNConfig, ReplayConfig
+from kungfu.config import DQNConfig, EncoderConfig, ReplayConfig
+from kungfu.rl.algos.base import Agent, Transition, UpdateStats
+from kungfu.rl.buffers import FrameReplayBuffer
 from kungfu.rl.networks import QNetwork
-from kungfu.rl.replay import FrameReplayBuffer
 
 
-@dataclass
-class LearnStats:
-    loss: float
-    q_mean: float
-    td_error: float
-    grad_norm: float
+class DQNAgent(Agent):
+    on_policy = False
+    name = "dqn"
 
-
-class DQNAgent:
     def __init__(
         self,
         obs_shape: tuple[int, int, int],
@@ -51,17 +36,29 @@ class DQNAgent:
         device: torch.device,
         seed: int = 0,
         num_envs: int = 1,
+        encoder_cfg: EncoderConfig | None = None,
     ) -> None:
+        super().__init__(device=device, num_envs=num_envs, seed=seed)
         c, h, w = obs_shape
         self.cfg = dqn_cfg
         self.replay_cfg = replay_cfg
-        self.device = device
         self.n_actions = n_actions
-        self.rng = np.random.default_rng(seed)
+        enc = encoder_cfg or EncoderConfig()
 
-        self.online = QNetwork(c, n_actions, (h, w), dqn_cfg.dueling, dqn_cfg.noisy).to(device)
-        self.target = QNetwork(c, n_actions, (h, w), dqn_cfg.dueling, dqn_cfg.noisy).to(device)
-        # Synchronise immediately -- the thing the original forgot.
+        def build() -> QNetwork:
+            return QNetwork(
+                c, n_actions, (h, w),
+                dueling=dqn_cfg.dueling,
+                noisy=dqn_cfg.noisy,
+                hidden=enc.hidden,
+                encoder=enc.name,
+                encoder_kwargs=enc.kwargs,
+            ).to(device)
+
+        self.online = build()
+        self.target = build()
+        # Synchronise immediately -- the 2021 version left these independently
+        # random, so early bootstrapping aimed at noise.
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
         for p in self.target.parameters():
@@ -83,11 +80,12 @@ class DQNAgent:
             num_envs=num_envs,
         )
 
-        self.num_envs = num_envs
-        self.steps = 0
-        self.updates = 0
         self._amp = device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self._amp)
+
+    @property
+    def modules(self) -> dict[str, nn.Module]:
+        return {"online": self.online, "target": self.target}
 
     # -- schedules ---------------------------------------------------------
     @property
@@ -102,39 +100,46 @@ class DQNAgent:
         frac = min(1.0, self.steps / self.replay_cfg.beta_frames)
         return self.replay_cfg.beta_start + frac * (1.0 - self.replay_cfg.beta_start)
 
+    def exploration(self) -> float:
+        return self.epsilon
+
     # -- acting ------------------------------------------------------------
     @torch.no_grad()
-    def act(self, obs: np.ndarray, greedy: bool = False) -> np.ndarray:
-        """``obs`` is (B, C, H, W) uint8. Returns (B,) int64 actions."""
+    def act(self, obs: np.ndarray, greedy: bool = False) -> tuple[np.ndarray, dict]:
         batch = obs.shape[0]
         eps = 0.0 if greedy else self.epsilon
         actions = self.rng.integers(0, self.n_actions, size=batch)
 
         explore = self.rng.random(batch) < eps
         if explore.all():
-            return actions
+            return actions, {}
 
         t = torch.as_tensor(obs, device=self.device)
         self.online.eval()
         q = self.online(t)
         self.online.train()
         greedy_actions = q.argmax(dim=1).cpu().numpy()
-        return np.where(explore, actions, greedy_actions)
-
-    def remember(
-        self,
-        obs: np.ndarray,
-        actions: np.ndarray,
-        rewards: np.ndarray,
-        dones: np.ndarray,
-        episode_starts: np.ndarray,
-    ) -> None:
-        """Record one vectorised timestep. ``obs`` is (E, C, H, W) uint8."""
-        self.memory.add(obs, actions, rewards, dones, episode_starts)
+        return np.where(explore, actions, greedy_actions), {}
 
     # -- learning ----------------------------------------------------------
-    def learn(self) -> LearnStats | None:
-        if self.steps < self.cfg.learn_start or not self.memory.ready:
+    def observe(self, t: Transition) -> None:
+        # Only a true terminal breaks bootstrapping; a time-limit truncation
+        # must still bootstrap or the agent learns the clock is a cliff.
+        self.memory.add(t.obs, t.actions, t.rewards, t.terminated, t.episode_starts)
+        self.steps += self.num_envs
+
+    def maybe_update(self) -> UpdateStats | None:
+        if self.steps % self.cfg.train_every >= self.num_envs:
+            return None
+        return self.learn()
+
+    def learn(self) -> UpdateStats | None:
+        # Gate on how much is actually in the buffer, not on the global step.
+        # They agree on a fresh run, but a resumed checkpoint arrives with
+        # steps already in the millions and an *empty* replay: gating on steps
+        # would start training instantly on ~10 transitions, and prioritised
+        # sampling would grind those few frames into the weights.
+        if len(self.memory) < self.cfg.learn_start or not self.memory.ready:
             return None
 
         batch = self.memory.sample(self.cfg.batch_size, self.beta, self.rng)
@@ -182,36 +187,36 @@ class DQNAgent:
         if self.updates % max(1, self.cfg.target_sync_every // self.cfg.train_every) == 0:
             self.target.load_state_dict(self.online.state_dict())
 
-        return LearnStats(
+        return UpdateStats(
             loss=float(loss.detach().cpu()),
-            q_mean=float(q_pred.detach().mean().cpu()),
-            td_error=float(td.mean()),
-            grad_norm=float(grad_norm),
+            extra={
+                "q_mean": float(q_pred.detach().mean().cpu()),
+                "td_error": float(td.mean()),
+                "grad_norm": float(grad_norm),
+                "beta": self.beta,
+            },
         )
 
     # -- checkpoints -------------------------------------------------------
-    def save(self, path: str | Path) -> None:
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "online": self.online.state_dict(),
-                "target": self.target.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "scaler": self.scaler.state_dict(),
-                "steps": self.steps,
-                "updates": self.updates,
-                "config": self.cfg.model_dump(),
-            },
-            p,
-        )
+    def state_dict(self) -> dict:
+        return {
+            "online": self.online.state_dict(),
+            "target": self.target.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scaler": self.scaler.state_dict(),
+            "steps": self.steps,
+            "updates": self.updates,
+            "config": self.cfg.model_dump(),
+        }
 
-    def load(self, path: str | Path, strict: bool = True) -> None:
-        ckpt = torch.load(Path(path), map_location=self.device, weights_only=False)
-        self.online.load_state_dict(ckpt["online"], strict=strict)
-        self.target.load_state_dict(ckpt["target"], strict=strict)
-        self.optimizer.load_state_dict(ckpt["optimizer"])
-        if "scaler" in ckpt:
-            self.scaler.load_state_dict(ckpt["scaler"])
-        self.steps = int(ckpt.get("steps", 0))
-        self.updates = int(ckpt.get("updates", 0))
+    def load_state_dict(self, state: dict, strict: bool = True) -> None:
+        # QNetwork.load_state_dict migrates pre-refactor key names, so
+        # checkpoints from before the encoder/head split still load.
+        self.online.load_state_dict(state["online"], strict=strict)
+        self.target.load_state_dict(state["target"], strict=strict)
+        if "optimizer" in state:
+            self.optimizer.load_state_dict(state["optimizer"])
+        if "scaler" in state:
+            self.scaler.load_state_dict(state["scaler"])
+        self.steps = int(state.get("steps", 0))
+        self.updates = int(state.get("updates", 0))

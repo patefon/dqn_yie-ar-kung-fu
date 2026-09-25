@@ -32,6 +32,13 @@ from kungfu.envs.reward import RewardShaper
 from kungfu.vision.atlas import DigitAtlas
 from kungfu.vision.hud import HudReader
 
+# Episode termination reasons, reported in info["end_reason"].
+END_NONE = 0
+END_GAMEOVER = 1
+END_STALL = 2
+END_TIME_LIMIT = 3
+END_REASON_NAMES = {END_GAMEOVER: "gameover", END_STALL: "stall", END_TIME_LIMIT: "time_limit"}
+
 
 class YieArKungFuEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array", "human"], "render_fps": 60}
@@ -86,6 +93,30 @@ class YieArKungFuEnv(gym.Env):
         self._gameover_streak = 0
         self._last_frame: np.ndarray | None = None
 
+        # Preload every start state once. reset() then only has to assign bytes
+        # rather than hit the disk, so a curriculum costs nothing per episode.
+        self._states: list[tuple[str, bytes]] = []
+        self._state_weights: np.ndarray | None = None
+        if env_cfg.start_states:
+            import gzip
+
+            for spec in env_cfg.start_states:
+                path = retro.data.get_file_path(
+                    env_cfg.game,
+                    spec.name if spec.name.endswith(".state") else spec.name + ".state",
+                    retro.data.Integrations.CUSTOM_ONLY,
+                )
+                if path is None:
+                    raise FileNotFoundError(
+                        f"start state {spec.name!r} not found for {env_cfg.game}. "
+                        "Generate it with: python -m tools.make_stage_states"
+                    )
+                with gzip.open(path, "rb") as fh:
+                    self._states.append((spec.name, fh.read()))
+            w = np.array([s.weight for s in env_cfg.start_states], dtype=np.float64)
+            self._state_weights = w / w.sum()
+        self._current_state = 0
+
     # -- observation -------------------------------------------------------
     def _observe(self, frame: np.ndarray) -> np.ndarray:
         """Crop to the playfield, grayscale, downscale.
@@ -109,6 +140,11 @@ class YieArKungFuEnv(gym.Env):
     # -- gym API -----------------------------------------------------------
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
+        if self._states:
+            self._current_state = int(
+                self.np_random.choice(len(self._states), p=self._state_weights)
+            )
+            self._retro.initial_state = self._states[self._current_state][1]
         frame, _ = self._retro.reset(seed=seed)
 
         # Random no-ops decorrelate parallel envs so they do not all walk the
@@ -182,10 +218,22 @@ class YieArKungFuEnv(gym.Env):
         # so a single hit of the signature is not game over.
         self._gameover_streak = self._gameover_streak + 1 if stats.is_gameover else 0
         terminated = terminated or self._gameover_streak >= self.cfg.gameover_patience
-        truncated = (
-            self._elapsed >= self.cfg.max_episode_steps
-            or self._steps_since_score >= self.cfg.stall_timeout
-        )
+        hit_time_limit = self._elapsed >= self.cfg.max_episode_steps
+        hit_stall = self._steps_since_score >= self.cfg.stall_timeout
+        truncated = hit_time_limit or hit_stall
+
+        # Why an episode ended is not recoverable after the fact, and the three
+        # reasons call for completely different fixes: dying means the policy is
+        # weak, stalling means it survives but cannot score, and the time limit
+        # means it outlived the clock. Logged as an int because Gymnasium's
+        # vector envs aggregate info into typed arrays and cannot hold strings.
+        end_reason = END_NONE
+        if terminated:
+            end_reason = END_GAMEOVER
+        elif hit_stall:
+            end_reason = END_STALL
+        elif hit_time_limit:
+            end_reason = END_TIME_LIMIT
 
         # Gymnasium's vector envs aggregate `info` into typed arrays and cannot
         # hold None, so unreadable fields are reported as -1 rather than None.
@@ -200,6 +248,8 @@ class YieArKungFuEnv(gym.Env):
             "best_score": int(self._best_score),
             "misreads": int(self._shaper.misreads),
             "reward_terms": breakdown.as_dict(),
+            "end_reason": int(end_reason),
+            "start_state": int(self._current_state),
         }
         return self._observe(frame), float(reward), bool(terminated), bool(truncated), info
 
