@@ -10,12 +10,13 @@ the screen correctly. Nothing under `envs/` or `rl/` imports it.
 
 <table>
 <tr>
-<td width="65%"><img src="resources/preview_2025.gif" alt="the 2025 agent, stage 21"></td>
+<td width="33%"><img src="resources/preview_final.gif" alt="the 2026 agent, stage 99+"></td>
+<td width="33%"><img src="resources/preview_2025.gif" alt="the 2025 agent, stage 21"></td>
 <td width="35%"><img src="resources/preview.gif" alt="the 2021 agent, stage 5"></td>
 </tr>
 <tr>
-<td><b>2025</b> — stage 21. Gameplay, the buttons the agent is pressing, the four
-frames the network receives, and the movement composite.</td>
+<td><b>2026</b> — stage 99+, agent won game</td>
+<td><b>2025</b> — <= stage 21</td>
 <td><b>2021</b> — stalled at ~stage 5.</td>
 </tr>
 </table>
@@ -393,8 +394,8 @@ legacy/                    the 2021 implementation, kept for comparison
 - [x] Get past the stage-21 wall (start-state curriculum)
 - [x] 50+ levels — **116 stages, ~1,162,400 points, counters wrapped**
 - [x] Race PPO against the DQN (DQN won on equal budget)
-- [ ] Survive a second counter wrap (stage 200+)
-- [ ] Automate the curriculum loop end to end
+- [x] Survive a second counter wrap (stage 99+)
+- [x] Automate the curriculum loop end to end
 
 ---
 
