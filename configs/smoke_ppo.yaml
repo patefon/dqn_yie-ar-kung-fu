@@ -1,0 +1,129 @@
+algo: ppo
+dqn:
+  adam_eps: 0.00015
+  batch_size: 32
+  double: true
+  dueling: true
+  eps_decay_steps: 8000
+  eps_end: 0.01
+  eps_start: 1.0
+  gamma: 0.99
+  huber_delta: 1.0
+  learn_start: 1000
+  lr: 6.25e-05
+  max_grad_norm: 10.0
+  noisy: false
+  target_sync_every: 8000
+  train_every: 4
+encoder:
+  channels: null
+  hidden: 512
+  name: nature_cnn
+  width: 1.0
+env:
+  frame_skip: 4
+  frame_stack: 4
+  game: YieArKungFu-Nes
+  gameover_patience: 8
+  grayscale: true
+  hud:
+    enemy_health:
+      h: 4
+      w: 64
+      x: 136
+      y: 202
+    gameover_banner:
+      h: 12
+      w: 128
+      x: 64
+      y: 114
+    gameover_banner_min_pixels: 40
+    health_fill_rgb:
+    - - 72
+      - 220
+      - 72
+    health_match_tolerance: 24
+    high_score:
+      h: 8
+      w: 48
+      x: 88
+      y: 40
+    lives:
+      h: 8
+      w: 40
+      x: 160
+      y: 40
+    lives_pixels_per_icon: 37
+    player_health:
+      h: 4
+      w: 64
+      x: 40
+      y: 202
+    playfield:
+      h: 150
+      w: 240
+      x: 0
+      y: 62
+    score:
+      h: 8
+      w: 48
+      x: 16
+      y: 40
+    stage:
+      h: 8
+      w: 16
+      x: 208
+      y: 32
+    transition_max_colors: 4
+  max_episode_steps: 6000
+  max_pool_frames: true
+  noop_max: 30
+  obs_height: 84
+  obs_width: 84
+  stall_timeout: 600
+  state: Level1
+  sticky_action_prob: 0.25
+ppo:
+  adam_eps: 1.0e-05
+  clip_coef: 0.1
+  clip_value_loss: true
+  entropy_coef: 0.01
+  epochs: 2
+  gae_lambda: 0.95
+  gamma: 0.99
+  horizon: 64
+  lr: 0.00025
+  max_grad_norm: 0.5
+  minibatch_size: 128
+  normalize_advantage: true
+  target_kl: 0.03
+  value_coef: 0.5
+replay:
+  alpha: 0.6
+  beta_frames: 1000000
+  beta_start: 0.4
+  capacity: 20000
+  n_step: 3
+  prioritized: true
+reward:
+  clip: 5.0
+  damage_dealt: 1.0
+  damage_taken: -1.0
+  death: -10.0
+  score_scale: 0.01
+  stage_clear: 10.0
+  time_penalty: -0.001
+train:
+  amp: true
+  auto_resume: true
+  checkpoint_every: 8000
+  device: auto
+  eval_episodes: 1
+  eval_every: 1000000000
+  num_envs: 4
+  record_eval_video: false
+  run_dir: runs
+  run_name: null
+  seed: 0
+  torch_compile: false
+  total_steps: 16000

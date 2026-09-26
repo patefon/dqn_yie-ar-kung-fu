@@ -1,4 +1,4 @@
-algo: dqn
+algo: ppo
 encoder:
   name: nature_cnn
   hidden: 512
@@ -7,10 +7,9 @@ encoder:
 env:
   game: YieArKungFu-Nes
   state: Level1
-  start_states: null
   frame_skip: 4
   max_pool_frames: true
-  frame_stack: 4
+  frame_stack: 16
   obs_height: 84
   obs_width: 84
   grayscale: true
@@ -104,9 +103,9 @@ ppo:
   gae_lambda: 0.95
   lr: 0.00025
   adam_eps: 1.0e-05
-  horizon: 128
+  horizon: 256
   epochs: 4
-  minibatch_size: 256
+  minibatch_size: 512
   clip_coef: 0.1
   value_coef: 0.5
   entropy_coef: 0.01

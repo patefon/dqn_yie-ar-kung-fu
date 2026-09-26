@@ -31,7 +31,7 @@ import tyro
 from rich.console import Console
 
 from kungfu.config import Config
-from kungfu.rl.dqn import DQNAgent
+from kungfu.rl.algos import build_agent
 from tools.mjpeg import FrameSlot, serve
 
 console = Console()
@@ -220,16 +220,8 @@ def run_viewer(args: Args) -> None:
     n_actions = int(envs.single_action_space.n)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    agent = DQNAgent(
-        obs_shape=obs_shape,
-        n_actions=n_actions,
-        dqn_cfg=cfg.dqn,
-        replay_cfg=cfg.replay,
-        device=device,
-        seed=1234,
-        num_envs=1,
-    )
-    agent.online.eval()
+    agent = build_agent(cfg, obs_shape, n_actions, device, seed=1234, num_envs=1)
+    agent.train_mode(False)
 
     loaded_from: Path | None = None
     loaded_step = 0
@@ -250,7 +242,7 @@ def run_viewer(args: Args) -> None:
             return
         try:
             agent.load(ckpt)
-            agent.online.eval()
+            agent.train_mode(False)
             loaded_from, loaded_step = ckpt, agent.steps
             console.print(f"loaded [green]{ckpt.name}[/green] @ step {agent.steps:,}")
         except Exception as exc:
@@ -289,7 +281,7 @@ def run_viewer(args: Args) -> None:
             t0 = time.time()
             try_reload()
 
-            actions = agent.act(obs, greedy=True)
+            actions, _ = agent.act(obs, greedy=True)
             explore = rng.random(args.envs) < args.epsilon
             if explore.any():
                 rand = rng.integers(0, n_actions, size=args.envs)

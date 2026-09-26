@@ -28,7 +28,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from kungfu.config import Config
 from kungfu.envs.actions import ACTION_NAMES
-from kungfu.rl.dqn import DQNAgent
+from kungfu.envs.kungfu import END_REASON_NAMES
+from kungfu.rl.algos import Agent, Transition, build_agent
 
 console = Console()
 
@@ -107,7 +108,7 @@ def find_c_compiler() -> str | None:
     return None
 
 
-def maybe_compile(agent: DQNAgent, cfg: Config, device: torch.device, obs_shape) -> bool:
+def maybe_compile(agent: Agent, cfg: Config, device: torch.device, obs_shape) -> bool:
     """Enable torch.compile only if it actually works, and prove it before training.
 
     torch.compile is lazy: it returns a wrapper immediately and Triton does not
@@ -133,17 +134,20 @@ def maybe_compile(agent: DQNAgent, cfg: Config, device: torch.device, obs_shape)
         )
         return False
 
-    eager_online, eager_target = agent.online, agent.target
+    # Compile whatever modules this algorithm happens to have -- DQN exposes
+    # online/target, PPO exposes a single actor-critic net.
+    eager = dict(agent.modules)
     try:
-        agent.online = torch.compile(agent.online)
-        agent.target = torch.compile(agent.target)
+        for attr, module in eager.items():
+            setattr(agent, attr, torch.compile(module))
         # Force the kernel build now, while we can still recover from it.
         probe = torch.zeros((cfg.train.num_envs, *obs_shape), dtype=torch.uint8, device=device)
         with torch.no_grad():
-            agent.online(probe)
-            agent.target(probe)
+            for module in agent.modules.values():
+                module(probe)
     except Exception as exc:
-        agent.online, agent.target = eager_online, eager_target
+        for attr, module in eager.items():
+            setattr(agent, attr, module)
         console.print(
             f"[yellow]torch.compile failed, continuing in eager mode:[/yellow] "
             f"[dim]{type(exc).__name__}: {str(exc).splitlines()[-1][:160]}[/dim]"
@@ -152,6 +156,24 @@ def maybe_compile(agent: DQNAgent, cfg: Config, device: torch.device, obs_shape)
 
     console.print(f"[green]torch.compile active[/green] [dim](cc: {compiler})[/dim]")
     return True
+
+
+def describe_agent(agent: Agent, cfg: Config, n_actions: int) -> str:
+    """One line naming the algorithm, trunk and memory footprint."""
+    params = sum(
+        p.numel() for m in agent.modules.values() for p in m.parameters() if p.requires_grad
+    )
+    bits = [
+        f"[bold]{agent.name}[/bold]",
+        f"encoder {cfg.encoder.name}",
+        f"{params / 1e6:.2f}M params",
+        f"{n_actions} actions",
+    ]
+    buf = getattr(agent, "memory", None) or getattr(agent, "buffer", None)
+    if buf is not None and hasattr(buf, "nbytes"):
+        kind = "replay" if agent.on_policy is False else "rollout"
+        bits.append(f"{kind} {buf.nbytes() / 1e9:.2f} GB")
+    return " | ".join(bits)
 
 
 def latest_checkpoint(run_dir: Path) -> Path | None:
@@ -165,7 +187,7 @@ def _moviepy_available() -> bool:
     return importlib.util.find_spec("moviepy") is not None
 
 
-def periodic_eval(cfg: Config, agent: DQNAgent, writer: SummaryWriter, run_dir: Path) -> None:
+def periodic_eval(cfg: Config, agent: Agent, writer: SummaryWriter, run_dir: Path) -> None:
     """Greedy rollouts on a separate env, logged as scalars plus a video.
 
     This is the "watch it get better" loop: every ``eval_every`` steps you get an
@@ -181,14 +203,19 @@ def periodic_eval(cfg: Config, agent: DQNAgent, writer: SummaryWriter, run_dir: 
 
     register(INTEGRATION_DIR)
     atlas = DigitAtlas.load(ATLAS_PATH)
+    # Evaluation always starts from Level1, even when training uses a
+    # start-state curriculum. Otherwise the score reports which savestate was
+    # sampled -- an episode seeded at Stage20 inherits ~219,500 points -- and
+    # the curve measures luck instead of skill.
+    eval_env_cfg = cfg.env.model_copy(update={"start_states": None})
     env = ChannelStack(
-        YieArKungFuEnv(cfg.env, cfg.reward, atlas, render_mode="rgb_array"),
+        YieArKungFuEnv(eval_env_cfg, cfg.reward, atlas, render_mode="rgb_array"),
         cfg.env.frame_stack,
     )
     env.reset(seed=cfg.train.seed + 9973)
 
-    was_training = agent.online.training
-    agent.online.eval()
+    was_training = next(iter(agent.modules.values())).training
+    agent.train_mode(False)
 
     results, best_frames, best_score = [], [], -1
     try:
@@ -201,7 +228,7 @@ def periodic_eval(cfg: Config, agent: DQNAgent, writer: SummaryWriter, run_dir: 
     finally:
         env.close()
         if was_training:
-            agent.online.train()
+            agent.train_mode(True)
 
     step = agent.steps
     writer.add_scalar("eval/score_mean", float(np.mean([r.score for r in results])), step)
@@ -265,19 +292,10 @@ def train(cfg: Config, args: Args) -> Path:
     obs_shape = envs.single_observation_space.shape
     n_actions = int(envs.single_action_space.n)
 
-    agent = DQNAgent(
-        obs_shape=obs_shape,
-        n_actions=n_actions,
-        dqn_cfg=cfg.dqn,
-        replay_cfg=cfg.replay,
-        device=device,
-        seed=seed,
-        num_envs=cfg.train.num_envs,
+    agent = build_agent(
+        cfg, obs_shape, n_actions, device, seed=seed, num_envs=cfg.train.num_envs
     )
-    console.print(
-        f"replay holds {cfg.replay.capacity:,} transitions "
-        f"({agent.memory.nbytes() / 1e9:.2f} GB) | actions: {n_actions}"
-    )
+    console.print(describe_agent(agent, cfg, n_actions))
 
     # Auto-resume: the old project defined load_models() and never called it.
     ckpt = args.resume or (latest_checkpoint(run_dir) if cfg.train.auto_resume else None)
@@ -296,40 +314,50 @@ def train(cfg: Config, args: Args) -> Path:
     returns = np.zeros(cfg.train.num_envs, dtype=np.float64)
     completed: list[float] = []
     best_score = 0
+    end_counts: dict[int, int] = {}
 
     total = args.total_steps or cfg.train.total_steps
     t0 = time.time()
     last_report = agent.steps
 
     while agent.steps < total:
-        actions = agent.act(obs)
+        actions, extras = agent.act(obs)
         next_obs, rewards, terms, truncs, infos = envs.step(actions)
         dones = np.logical_or(terms, truncs)
 
-        agent.remember(obs, actions, rewards, terms, episode_starts)
+        agent.observe(
+            Transition(
+                obs=obs,
+                actions=actions,
+                rewards=rewards,
+                terminated=terms,
+                truncated=truncs,
+                next_obs=next_obs,
+                episode_starts=episode_starts,
+                extras=extras,
+            )
+        )
         # Only a true terminal breaks bootstrapping; a time-limit truncation
         # must still bootstrap or the agent learns the clock is a cliff.
         episode_starts = dones.copy()
         returns += rewards
         obs = next_obs
 
-        agent.steps += cfg.train.num_envs
-
-        if agent.steps % cfg.dqn.train_every < cfg.train.num_envs:
-            stats = agent.learn()
-            if stats is not None and agent.steps % 1000 < cfg.train.num_envs:
-                writer.add_scalar("loss/huber", stats.loss, agent.steps)
-                writer.add_scalar("q/mean", stats.q_mean, agent.steps)
-                writer.add_scalar("q/td_error", stats.td_error, agent.steps)
-                writer.add_scalar("optim/grad_norm", stats.grad_norm, agent.steps)
-                writer.add_scalar("explore/epsilon", agent.epsilon, agent.steps)
-                writer.add_scalar("replay/beta", agent.beta, agent.steps)
+        # The agent owns its own update cadence: DQN trains every few steps,
+        # PPO only when its rollout segment is full.
+        stats = agent.maybe_update()
+        if stats is not None and agent.steps % 1000 < cfg.train.num_envs:
+            for key, value in stats.as_dict().items():
+                writer.add_scalar(f"{agent.name}/{key}", value, agent.steps)
+            writer.add_scalar("explore/value", agent.exploration(), agent.steps)
 
         for i, done in enumerate(dones):
             if not done:
                 continue
             completed.append(float(returns[i]))
             returns[i] = 0.0
+            reason = int(np.atleast_1d(infos.get("end_reason", 0))[i]) if "end_reason" in infos else 0
+            end_counts[reason] = end_counts.get(reason, 0) + 1
 
         # Per-term reward accounting keeps shaping honest and debuggable.
         if "reward_terms" in infos and agent.steps % 2000 < cfg.train.num_envs:
@@ -354,10 +382,20 @@ def train(cfg: Config, args: Args) -> Path:
             writer.add_scalar("episode/return_mean100", avg_return, agent.steps)
             writer.add_scalar("episode/count", len(completed), agent.steps)
             writer.add_scalar("game/best_score", best_score, agent.steps)
+            # Share of episodes ending each way. A run dominated by "stall" is
+            # being cut off while alive, not beaten -- a config problem, not a
+            # learning one.
+            total_ends = sum(end_counts.values())
+            if total_ends:
+                for code, label in END_REASON_NAMES.items():
+                    writer.add_scalar(
+                        f"episode_end/{label}", end_counts.get(code, 0) / total_ends, agent.steps
+                    )
             console.print(
                 f"step {agent.steps:>10,} | {fps:6.0f} fps | "
-                f"return(100) {avg_return:8.2f} | eps {agent.epsilon:.3f} | "
-                f"episodes {len(completed):,} | best score {best_score:,}"
+                f"return(100) {avg_return:8.2f} | explore {agent.exploration():.3f} | "
+                f"episodes {len(completed):,} | best score {best_score:,} | "
+                f"ends {'/'.join(f'{END_REASON_NAMES[c][:4]}:{end_counts.get(c, 0)}' for c in END_REASON_NAMES)}"
             )
             last_report = agent.steps
             t0 = time.time()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kungfu.config import Config, EnvConfig, Region
+from kungfu.config import Config, EnvConfig, Region, StartState
 from kungfu.rl.networks import QNetwork
 
 
@@ -75,6 +75,26 @@ class TestConfig:
         assert Config.load(shipped).model_dump() == Config().model_dump(), (
             "configs/default.yaml is stale; regenerate it with `make config`"
         )
+
+    def test_start_states_default_to_none(self):
+        """No curriculum configured must keep the original single-state path."""
+        assert Config().env.start_states is None
+
+    def test_start_state_weight_must_be_positive(self):
+        with pytest.raises(ValueError):
+            StartState(name="Stage10", weight=0)
+
+    def test_start_states_survive_a_yaml_roundtrip(self, tmp_path):
+        cfg = Config()
+        cfg.env.start_states = [
+            StartState(name="Level1", weight=1.0),
+            StartState(name="Stage20", weight=2.5),
+        ]
+        p = tmp_path / "c.yaml"
+        cfg.dump(p)
+        loaded = Config.load(p)
+        assert [s.name for s in loaded.env.start_states] == ["Level1", "Stage20"]
+        assert loaded.env.start_states[1].weight == 2.5
 
     def test_yaml_roundtrip(self, tmp_path):
         cfg = Config()

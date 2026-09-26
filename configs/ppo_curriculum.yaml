@@ -1,4 +1,4 @@
-algo: dqn
+algo: ppo
 encoder:
   name: nature_cnn
   hidden: 512
@@ -7,7 +7,6 @@ encoder:
 env:
   game: YieArKungFu-Nes
   state: Level1
-  start_states: null
   frame_skip: 4
   max_pool_frames: true
   frame_stack: 4
@@ -16,8 +15,8 @@ env:
   grayscale: true
   sticky_action_prob: 0.25
   noop_max: 30
-  max_episode_steps: 6000
-  stall_timeout: 600
+  max_episode_steps: 20000
+  stall_timeout: 1500
   gameover_patience: 8
   hud:
     score:
@@ -68,6 +67,17 @@ env:
       - 72
     health_match_tolerance: 24
     transition_max_colors: 4
+  start_states:
+  - name: Level1
+    weight: 1.0
+  - name: Stage5
+    weight: 1.0
+  - name: Stage10
+    weight: 1.5
+  - name: Stage15
+    weight: 2.0
+  - name: Stage20
+    weight: 2.5
 reward:
   score_scale: 0.01
   damage_dealt: 1.0
@@ -104,9 +114,9 @@ ppo:
   gae_lambda: 0.95
   lr: 0.00025
   adam_eps: 1.0e-05
-  horizon: 128
+  horizon: 256
   epochs: 4
-  minibatch_size: 256
+  minibatch_size: 512
   clip_coef: 0.1
   value_coef: 0.5
   entropy_coef: 0.01
@@ -116,7 +126,7 @@ ppo:
   target_kl: 0.03
 train:
   total_steps: 10000000
-  num_envs: 8
+  num_envs: 16
   seed: 0
   device: auto
   torch_compile: true

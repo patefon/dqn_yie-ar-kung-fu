@@ -20,7 +20,7 @@ from rich.console import Console
 from rich.table import Table
 
 from kungfu.config import Config
-from kungfu.rl.dqn import DQNAgent
+from kungfu.rl.algos import Agent, build_agent
 
 console = Console()
 
@@ -54,7 +54,7 @@ class EpisodeResult:
 
 def run_episode(
     env,
-    agent: DQNAgent,
+    agent: Agent,
     epsilon: float,
     capture: bool,
     rng: np.random.Generator | None = None,
@@ -70,7 +70,7 @@ def run_episode(
         if rng.random() < epsilon:
             action = int(rng.integers(0, agent.n_actions))
         else:
-            action = int(agent.act(batch, greedy=True)[0])
+            action = int(agent.act(batch, greedy=True)[0][0])
 
         obs, reward, terminated, truncated, info = env.step(action)
         total += float(reward)
@@ -117,24 +117,23 @@ def evaluate(cfg: Config, args: Args) -> list[EpisodeResult]:
     )
     register(INTEGRATION_DIR)
     atlas = DigitAtlas.load("configs/digit_atlas.json")
+    # Same reason as periodic_eval: a curriculum belongs to training only.
+    if cfg.env.start_states:
+        console.print("[dim]ignoring training start_states; evaluating from Level1[/dim]")
+    eval_env_cfg = cfg.env.model_copy(update={"start_states": None})
     env = ChannelStack(
-        YieArKungFuEnv(cfg.env, cfg.reward, atlas, render_mode="rgb_array"),
+        YieArKungFuEnv(eval_env_cfg, cfg.reward, atlas, render_mode="rgb_array"),
         cfg.env.frame_stack,
     )
     env.reset(seed=args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    agent = DQNAgent(
-        obs_shape=env.observation_space.shape,
-        n_actions=int(env.action_space.n),
-        dqn_cfg=cfg.dqn,
-        replay_cfg=cfg.replay,
-        device=device,
-        seed=args.seed,
-        num_envs=1,
+    agent = build_agent(
+        cfg, env.observation_space.shape, int(env.action_space.n),
+        device, seed=args.seed, num_envs=1,
     )
     agent.load(args.checkpoint)
-    agent.online.eval()
+    agent.train_mode(False)
 
     rng = np.random.default_rng(args.seed)
     results: list[EpisodeResult] = []
